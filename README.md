@@ -26,6 +26,13 @@ From there you can perform additional analytics on this data to accomplish your 
 Install all packages using:
 `npm install`
 
+You'll need to add two values into the `config.js` file:
+
+- enterpriseAccountIds: a list of the Enterprise Accounts that you are scanning. To find your enterpriseAccountId, go to your Enterprise Admin Panel.
+- adminUserId: the Airtable user ID for the user whose API key you are using to execute this script. This user must be an admin on all Enterprise Accounts you provide.
+
+You'll also want to set an environment variable `AIRTABLE_API_ADMIN_KEY` which is the API key for the adminUserId user.
+
 Then run `npm run start [-- --scan_id=some_scan_id --delete_data]`
 
 ## SQLite Database
@@ -54,7 +61,7 @@ Using this, you can then restart the script without rescanning bases that have a
 For example, if your Scan ID is `11b68d3c-66b0-4cac-a6d4-7458cbc5b1f2`, and you have 1000 bases in your Enterprise Account. The script only makes it through 80% of those bases (for any number of reasons), and you want to restart it to complete the operation, you can run the script as:
 `npm run -- --scan_id='11b68d3c-66b0-4cac-a6d4-7458cbc5b1f2'`
 
-It will ignore the 80% of bases already scanned, and only pick up the remaining 20%.
+In this example, tt will ignore the 80% of bases already scanned, and only pick up the remaining 20%.
 
 ## Handling Data Deletion
 

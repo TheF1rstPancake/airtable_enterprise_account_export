@@ -73,16 +73,46 @@ function asyncOp(db, statement, payload) {
   });
 }
 
+async function deleteData(db, scan_id, table_name, primary_field) {
+  // find all items in this table where the base was never scanned OR the scan_id does not
+  // match the one provided. This is the list of bases that we did not scan
+  // in this most recent run 
+  let to_delete = await (new Promise((resolve, reject) => {
+    db.all(`SELECT ${primary_field} FROM ${table_name} WHERE scan_id !=? OR scan_id IS NULL`, [scan_id], function (err, rows) {
+      if (err !== null) {
+        reject(err);
+        return;
+      }
+      resolve(rows);
+    })
+  }));
+
+
+  // build the list of ids that we need to delete
+  console.log(`Found ${to_delete.length} items to delete`);
+  to_delete = to_delete.map((b) => {
+    return b[primary_field]
+  })
+  console.log(`Deleting ${to_delete} items`);
+
+  let qs = to_delete.map(() => {
+    return '?'
+  }).join(",");
+  await asyncOp(db, `DELETE FROM ${table_name} WHERE ${primary_field} IN(${qs})`, to_delete);
+}
+
+
 /**
  * Run this script to read all data out of all bases in the Enterprise Account
  * @param {*} db 
  * @param {string} scan_id 
  * @param {boolean} delete_data
  */
-async function run(db, scan_id, delete_data) {
+async function run(db, scan_id, delete_data, ) {
 
   // pull all bases out of our sqlite database
-  console.log("Fetching bases: ", scan_id);
+  console.log("Fetching : ", scan_id);
+
   let p = new Promise((resolve, reject) => {
     db.all('SELECT * FROM bases WHERE scan_id !=? OR scan_id IS NULL', [scan_id], function (err, rows) {
       if (err !== null) {
@@ -126,15 +156,14 @@ async function run(db, scan_id, delete_data) {
     // for each base, we need to get a list of all of it's tables via metadata api
     console.log(`Getting tables for base ${base_id}`);
     try {
-      r = await requestWithRetry(admin.get(`meta/bases/${base_id}/tables`), base_id);
+      var metadata = await requestWithRetry(admin.get(`meta/bases/${base_id}/tables`), base_id);
     } catch (err) {
       if (err.response.status === 403) {
         console.log(`WARN: ${base_id} is not set up for Metadata API.  It may still be on a Pro Plan.  Reach out to Airtable Support for more details`);
-        return;
+        return 0;
       }
       throw err;
     }
-    let tables = r.data.tables;
 
     // set up the Airtable SDK to take action on the given base
     let base = new airtable({
@@ -143,6 +172,7 @@ async function run(db, scan_id, delete_data) {
 
     // iterate over each table.  Don't complete the operation until all records have been written to the database
     // the return will be a list of records written for each table.  We can sum those values to get the total number of records written
+    let tables = metadata.data.tables;
     let record_numbers = await Promise.map(tables, async (t) => {
       // get all records.  This handles pagination for us
       console.log(`Pulling data from ${t.id} in ${base_id}`);
@@ -206,45 +236,11 @@ async function run(db, scan_id, delete_data) {
   }
   console.log("Delete data flag passed.  Beginning to remove bases and data that no longer exist in Enterprise account");
 
-  let bases_to_delete = await (new Promise((resolve, reject) => {
-    db.all('SELECT id FROM bases WHERE scan_id !=? OR scan_id IS NULL', [scan_id], function (err, rows) {
-      if (err !== null) {
-        reject(err);
-        return;
-      }
-      resolve(rows);
-    })
-  }));
-  // for each base, issue the delete command and cascade the delete so that all records associated with that base are also deleted.
-  console.log(`Found ${bases_to_delete.length} bases to delete`);
-  bases_to_delete = bases_to_delete.map((b) => {
-    return b.id
-  })
-  console.log(`Deleting ${bases_to_delete} bases`);
+  // delete bases
+  await deleteData(db, scan_id, 'bases', 'id');
 
-  let qs = bases_to_delete.map(() => {
-    return '?'
-  }).join(",");
-  await asyncOp(db, `DELETE FROM bases WHERE id IN(${qs})`, bases_to_delete);
-
-  // now do the same for all records that don't match the scan_id
-  console.log(`Looking for records to delete`);
-  let records_to_delete = await (new Promise((resolve, reject) => {
-    db.all('SELECT record_id FROM data WHERE scan_id !=?', [scan_id], function (err, rows) {
-      if (err !== null) {
-        reject(err);
-        return;
-      }
-      resolve(rows);
-    })
-  }));
-  console.log(`Delete ${records_to_delete.length} records`)
-
-  qs = records_to_delete.map(() => {
-    return '?';
-  }).join(',');
-
-  await asyncOp(db, `DELETE FROM bases WHERE id IN(${qs})`, records_to_delete);
+  // delete records
+  await deleteData(db, scan_id, 'data', 'record_id');
 
 }
 

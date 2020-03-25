@@ -27,81 +27,84 @@ const admin = axios.create({
 });
 
 async function run(db) {
-  // get a list of all users and workspaces
-  var res = await admin.get(`meta/enterpriseAccounts/${config.enterpriseAccountId}`);
+  // get a list of all users and workspaces.  Do this for each enterprise account id
+  for (var i in config.enterpriseAccountId) {
+    let enterpriseAccountId = config.enterpriseAccountId[i];
+    var res = await admin.get(`meta/enterpriseAccounts/${enterpriseAccountId}`);
 
-  var user_ids = res.data.userIds;
-  var workspaces = res.data.workspaceIds;
+    var user_ids = res.data.userIds;
+    var workspaces = res.data.workspaceIds;
 
 
-  // for each workspace, get a list of all bases
-  // start building out our queue of bases that we need to scan
-  // at this point, we can also get data about who owns the workspace
-  var queue = [];
-  console.log("Fetching workspace data and writing to database");
-  await Promise.map(workspaces, async (wid) => {
-    let r = await admin.get(`meta/workspaces/${wid}`);
+    // for each workspace, get a list of all bases
+    // start building out our queue of bases that we need to scan
+    // at this point, we can also get data about who owns the workspace
+    var queue = [];
+    console.log("Fetching workspace data and writing to database");
+    await Promise.map(workspaces, async (wid) => {
+      let r = await admin.get(`meta/workspaces/${wid}`);
 
-    let owners = r.data.workspaceCollaborators.filter((o) => {
-      if (o.permissionLevel === 'owner') {
-        return o;
-      }
-    }).map(o => {
-      return o.email
-    }).join(',');
-
-    // build the payload for what we will write to our local database about the workspace
-    let payload = {
-      $id: wid,
-      $owners: owners,
-      $created_time: r.data.created_time,
-      $name: r.data.name
-    };
-
-    // wait for the record to be inserted
-    new Promise((resolve, reject) => {
-      db.run('INSERT OR REPLACE INTO workspaces (id, owners, created_time, name) VALUES ($id, $owners, $created_time, $name)', payload, ((err, rows) => {
-        if (err !== null) {
-          reject(err);
+      let owners = r.data.workspaceCollaborators.filter((o) => {
+        if (o.permissionLevel === 'owner') {
+          return o;
         }
-        resolve(rows);
-      }));
+      }).map(o => {
+        return o.email
+      }).join(',');
+
+      // build the payload for what we will write to our local database about the workspace
+      let payload = {
+        $id: wid,
+        $owners: owners,
+        $created_time: r.data.created_time,
+        $name: r.data.name
+      };
+
+      // wait for the record to be inserted
+      new Promise((resolve, reject) => {
+        db.run('INSERT OR REPLACE INTO workspaces (id, owners, created_time, name) VALUES ($id, $owners, $created_time, $name)', payload, ((err, rows) => {
+          if (err !== null) {
+            reject(err);
+          }
+          resolve(rows);
+        }));
+      });
+
+      // iterate through all base IDs in the workspace and create the object
+      // for our queue to scan
+      for (var i in r.data.baseIds) {
+        let b = r.data.baseIds[i];
+        queue.push({
+          workspace_id: wid,
+          base_id: b
+        });
+      }
+    }, {
+      concurrency: 10
     });
 
-    // iterate through all base IDs in the workspace and create the object
-    // for our queue to scan
-    for (var i in r.data.baseIds) {
-      let b = r.data.baseIds[i];
-      queue.push({
-        workspace_id: wid,
-        base_id: b
-      });
-    }
-  }, {
-    concurrency: 10
-  });
 
+    // now for each item in the queue
+    // fetch the base and write the base details to the table
+    console.log(`Found ${queue.length} bases`);
+    console.log("Fetching bases and writing to database");
+    await Promise.map(queue, async (q) => {
+      let r = await admin.get(`meta/bases/${q.base_id}`);
 
-  // now for each item in the queue
-  // fetch the base and write the base details to the table
-  console.log(`Found ${queue.length} bases`);
-  console.log("Fetching bases and writing to database");
-  await Promise.map(queue, async (q) => {
-    let r = await admin.get(`meta/bases/${q.base_id}`);
+      let payload = {
+        $id: q.base_id,
+        $workspace_id: q.workspace_id,
+        $name: r.data.name,
+        $created_time: r.data.created_time
+      }
 
-    let payload = {
-      $id: q.base_id,
-      $workspace_id: q.workspace_id,
-      $name: r.data.name,
-      $created_time: r.data.created_time
-    }
+      // insert
+      db.run('INSERT OR REPLACE INTO bases (id, workspace_id, created_time, name) VALUES ($id, $workspace_id, $created_time, $name)', payload)
 
-    // insert
-    db.run('INSERT OR REPLACE INTO bases (id, workspace_id, created_time, name) VALUES ($id, $workspace_id, $created_time, $name)', payload)
-
-  }, {
-    concurrency: 10
-  })
+    }, {
+      concurrency: 10
+    })
+  }
 
 }
 
