@@ -9,6 +9,8 @@ const argv = require('yargs')
   .scriptName("bulk-export")
   .argv;
 
+var UNSCANNED_BASES = [];
+
 /**
  * For each base:
  *  Add admin as a read only collaborator to a base
@@ -136,7 +138,7 @@ async function run(db, scan_id, delete_data, ) {
     let base_id = b.id;
     console.log(`Adding admin to base ${base_id}`);
     try {
-      let r = await requestWithRetry(admin.post(`meta/bases/${base_id}/collaborators`, {
+      var r = await requestWithRetry(admin.post(`meta/bases/${base_id}/collaborators`, {
         collaborators: [{
           user: {
             id: config.adminUserId
@@ -146,10 +148,15 @@ async function run(db, scan_id, delete_data, ) {
       }), base_id);
     } catch (err) {
       // it is possible the base no longer exists.  return 0 records in this case and do not update the scan ID
-      if (err.response.status === 404 || err.response.data.error === 'NOT_FOUND') {
+      if ((err.response.status === 404 || err.response.data.error === 'NOT_FOUND')) {
         console.log(`WARN: ${base_id} cannot be found.  Skipping scan`);
         return 0;
+      } else if (err.response.status === 403) {
+        console.log(`WARN: Admin could not be added to base_id ${base_id}.  Skipping`);
+        UNSCANNED_BASES.push(base_id);
+        return 0;
       }
+      throw err;
     }
 
 
@@ -173,33 +180,48 @@ async function run(db, scan_id, delete_data, ) {
     // iterate over each table.  Don't complete the operation until all records have been written to the database
     // the return will be a list of records written for each table.  We can sum those values to get the total number of records written
     let tables = metadata.data.tables;
-    let record_numbers = await Promise.map(tables, async (t) => {
-      // get all records.  This handles pagination for us
-      console.log(`Pulling data from ${t.id} in ${base_id}`);
-      let records = await requestWithRetry(base(t.name).select().all(), t.id);
-      console.log(`Writing ${records.length} records to database for ${t.id} in ${base_id}`);
-
-      // for each record, create the object to write to our database
-      var promises = records.map((rec) => {
-        let payload = {
-          $base_id: base_id,
-          $table_id: t.id,
-          $record_id: rec.id,
-          $data: JSON.stringify(rec.fields),
-          $created_time: rec._rawJson.createdTime,
-          $scan_id: scan_id
+    try {
+      var record_numbers = await Promise.map(tables, async (t) => {
+        // get all records.  This handles pagination for us
+        console.log(`Pulling data from ${t.id} in ${base_id}`);
+        try {
+          var records = await requestWithRetry(base(t.name).select().all(), t.id);
+        } catch (err) {
+          console.log(`ERR: Error requesting all data from base ${base_id} and table ${t.name}. Skipping this scan`);
+          throw err;
         }
-        return asyncOp(db, `INSERT OR REPLACE INTO data (base_id, table_id, record_id, created_time, data, scan_id) VALUES ($base_id, $table_id, $record_id, $data, $created_time, $scan_id)`, payload);
+        console.log(`Writing ${records.length} records to database for ${t.id} in ${base_id}`);
+
+        // for each record, create the object to write to our database
+        var promises = records.map((rec) => {
+          let payload = {
+            $base_id: base_id,
+            $table_id: t.id,
+            $record_id: rec.id,
+            $data: JSON.stringify(rec.fields),
+            $created_time: rec._rawJson.createdTime,
+            $scan_id: scan_id
+          }
+          return asyncOp(db, `INSERT OR REPLACE INTO data (base_id, table_id, record_id, created_time, data, scan_id) VALUES ($base_id, $table_id, $record_id, $data, $created_time, $scan_id)`, payload);
+        });
+
+        // wait for all promises to resolve before moving on.
+        let results = await Promise.all(promises);
+        console.log(`All records written for ${t.id} in ${base_id}`);
+        return results.length;
+      }, {
+        concurrency: 5
       });
-
-      // wait for all promises to resolve before moving on.
-      let results = await Promise.all(promises);
-      console.log(`All records written for ${t.id} in ${base_id}`);
-      return results.length;
-    }, {
-      concurrency: 5
-    });
-
+    } catch (err) {
+      // if a single table fails, the entire Promise.all() fails.  We do not want to kill the entire process
+      // we should flag the base so that it can be scanned again in the future. 
+      // this will skip the base from being written as "scanned"
+      // but won't prevent us from trying to scan the rest of the bases
+      console.log(`ERR: was not able to scan all of ${base_id}.  Skipping so other bases can be scanned`)
+      console.log(err);
+      UNSCANNED_BASES.push(base_id);
+      return;
+    }
     // calculate the total number of records.  This can be helpful for logging and debugging
     let num_records = record_numbers.reduce((aggregate, current) => {
       return aggregate + current;
@@ -267,6 +289,10 @@ if (require.main === module) {
   run(db, scan_id, delete_data)
     .then((res) => {
       let toc = new Date();
+      if (UNSCANNED_BASES.length !== 0) {
+        console.log('WARN: could not scan all bases.  Here are the ones we had to skip');
+        console.log(JSON.stringify(UNSCANNED_BASES));
+      }
       console.log(`Success ${scan_id}.  Base data parsed`);
       console.log(`Operation took ${(toc.getTime()-tic.getTime())/1000} seconds`);
       db.close();

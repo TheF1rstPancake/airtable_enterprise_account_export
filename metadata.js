@@ -42,9 +42,9 @@ async function run(db) {
     var queue = [];
     console.log("Fetching workspace data and writing to database");
     await Promise.map(workspaces, async (wid) => {
-      let r = await admin.get(`meta/workspaces/${wid}`);
+      let r = await admin.get(`meta/workspaces/${wid}?include=collaborators`);
 
-      let owners = r.data.workspaceCollaborators.filter((o) => {
+      let owners = r.data.collaborators.workspaceCollaborators.filter((o) => {
         if (o.permissionLevel === 'owner') {
           return o;
         }
@@ -99,7 +99,7 @@ async function run(db) {
       }
 
       // insert
-      db.run('INSERT OR REPLACE INTO bases (id, workspace_id, created_time, name) VALUES ($id, $workspace_id, $created_time, $name)', payload)
+      await db.run('INSERT OR REPLACE INTO bases (id, workspace_id, created_time, name) VALUES ($id, $workspace_id, $created_time, $name)', payload)
 
     }, {
       concurrency: 10
