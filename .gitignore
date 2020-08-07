@@ -1,4 +1,6 @@
 *.sqlite
+attachments/
+!attachments/README.md
 
 # Logs
 logs

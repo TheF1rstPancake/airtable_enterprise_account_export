@@ -5,6 +5,11 @@ const airtable = require('airtable');
 const config = require('./config');
 const uuid = require('uuid');
 
+const fs = require('fs');
+const path = require('path');
+
+const ATTACHMENT_DIR = './attachments';
+
 const argv = require('yargs')
   .scriptName("bulk-export")
   .argv;
@@ -57,74 +62,67 @@ async function requestWithRetry(request, request_id, retry_count) {
   }
 }
 
-/**
- * Run an operation in our SQLite database.  Returns a promise which resolves when the statement completes.
- * @param {*} db sqlite database connection object
- * @param {*} statement SQL statement (string) to run
- * @param {*} payload data to include in the SQL statement
- */
-function asyncOp(db, statement, payload) {
-  return new Promise((resolve, reject) => {
-    db.run(statement, payload, (err, row) => {
-      if (err !== null) {
-        reject(err);
-        return;
-      }
-      resolve(row);
-    });
+function findAttachmentField(table) {
+  return table.fields.filter((f) => {
+    return f.type === 'multipleAttachments';
   });
 }
 
-async function deleteData(db, scan_id, table_name, primary_field) {
-  // find all items in this table where the base was never scanned OR the scan_id does not
-  // match the one provided. This is the list of bases that we did not scan
-  // in this most recent run 
-  let to_delete = await (new Promise((resolve, reject) => {
-    db.all(`SELECT ${primary_field} FROM ${table_name} WHERE scan_id !=? OR scan_id IS NULL`, [scan_id], function (err, rows) {
-      if (err !== null) {
-        reject(err);
-        return;
+async function downloadAttachmentsAsync(base_id, table, records, attachment_fields, attachment_path) {
+  // for each record, pull out their attachments
+  var num_attachments = 0;
+  var attachments = [];
+  for (let r of records) {
+    for (let f of attachment_fields) {
+      if (r.fields[f.name] !== undefined) {
+        attachments = [...attachments, ...r.fields[f.name]];
       }
-      resolve(rows);
-    })
-  }));
+    }
+  }
 
+  // update our counter 
+  num_attachments += attachments.length;
+  console.log(`Found ${num_attachments} attachments in ${base_id}: ${table.id}`);
+  console.log(`Downloading attachments to ${attachment_path}`);
 
-  // build the list of ids that we need to delete
-  console.log(`Found ${to_delete.length} items to delete`);
-  to_delete = to_delete.map((b) => {
-    return b[primary_field]
-  })
-  console.log(`Deleting ${to_delete} items`);
+  // for each attachment, make a request to pull down the attachment
+  // and write it to this base's folder
+  // let's also limit how many attachments we try and fetch at once
+  await Promise.map(attachments, async (a) => {
+    var response = await axios({
+      url: a.url,
+      method: 'GET',
+      responseType: 'stream'
+    });
 
-  let qs = to_delete.map(() => {
-    return '?'
-  }).join(",");
-  await asyncOp(db, `DELETE FROM ${table_name} WHERE ${primary_field} IN(${qs})`, to_delete);
+    // the file path for any given file is our attachment
+    // directory + (attachment ID_filename) 
+    // using the ID ensures we don't overwrite files that may have the same name in a base
+    var file = path.join(attachment_path, `${a.id}_${a.filename}`);
+    var writer = fs.createWriteStream(file);
+
+    response.data.pipe(writer);
+    var p = new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    });
+    await p;
+    return;
+  }, {
+    concurrency: 10
+  });
+  return num_attachments;
 }
 
 
 /**
  * Run this script to read all data out of all bases in the Enterprise Account
- * @param {*} db 
- * @param {string} scan_id 
- * @param {boolean} delete_data
+ * @param {string[]} bases
  */
-async function run(db, scan_id, delete_data) {
+async function run(bases) {
 
-  // pull all bases out of our sqlite database
-  console.log("Fetching : ", scan_id);
-
-  let p = new Promise((resolve, reject) => {
-    db.all('SELECT * FROM bases WHERE scan_id !=? OR scan_id IS NULL', [scan_id], function (err, rows) {
-      if (err !== null) {
-        reject(err);
-        return;
-      }
-      resolve(rows);
-    })
-  });
-  var bases = await p;
+  // bases should be a list of objects
+  // [{id: 'apXXXXX', ...}, ....]
   console.log(`Found ${bases.length} bases`);
 
   // now for all bases, add the admin as a read only collaborator
@@ -177,6 +175,13 @@ async function run(db, scan_id, delete_data) {
       apiKey: process.env.AIRTABLE_API_ADMIN_KEY
     }).base(base_id);
 
+
+    // create a folder for managing this base's attachments
+    var attachment_path = path.join(ATTACHMENT_DIR, base_id);
+    if (!fs.existsSync(attachment_path)) {
+      fs.mkdirSync(attachment_path);
+    }
+
     // iterate over each table.  Don't complete the operation until all records have been written to the database
     // the return will be a list of records written for each table.  We can sum those values to get the total number of records written
     let tables = metadata.data.tables;
@@ -184,35 +189,41 @@ async function run(db, scan_id, delete_data) {
       var record_numbers = await Promise.map(tables, async (t) => {
         // get all records.  This handles pagination for us
         console.log(`Pulling data from ${t.id} in ${base_id}`);
+        var num_attachments = 0;
+
+        var attachment_fields = findAttachmentField(t);
+        console.log(`Found ${JSON.stringify(attachment_fields)} attachment fields`);
+        if (attachment_fields.length === 0) {
+          console.log(`Found 0 attachment fields in table -- ${table.id}`);
+          return 0;
+        }
+
         try {
-          var records = await requestWithRetry(base(t.name).select().all(), t.id);
+          await requestWithRetry(
+            base(t.name).select().eachPage(async function page(records, fetchNextPage) {
+              // for each attachment, make a request to pull down the attachment
+              // and write it to this base's folder
+              var num_downloaded = await downloadAttachmentsAsync(
+                base_id, t, records, attachment_fields, attachment_path
+              );
+
+              num_attachments += num_downloaded;
+
+              fetchNextPage();
+            })
+          );
         } catch (err) {
           console.log(`ERR: Error requesting all data from base ${base_id} and table ${t.name}. Skipping this scan`);
           throw err;
         }
-        console.log(`Writing ${records.length} records to database for ${t.id} in ${base_id}`);
 
-        // for each record, create the object to write to our database
-        var promises = records.map((rec) => {
-          let payload = {
-            $base_id: base_id,
-            $table_id: t.id,
-            $record_id: rec.id,
-            $data: JSON.stringify(rec.fields),
-            $created_time: rec._rawJson.createdTime,
-            $scan_id: scan_id
-          }
-          return asyncOp(db, `INSERT OR REPLACE INTO data (base_id, table_id, record_id, created_time, data, scan_id) VALUES ($base_id, $table_id, $record_id, $data, $created_time, $scan_id)`, payload);
-        });
-
-        // wait for all promises to resolve before moving on.
-        let results = await Promise.all(promises);
-        console.log(`All records written for ${t.id} in ${base_id}`);
-        return results.length;
+        console.log(`All attachments written for ${t.id} in ${base_id} -- ${num_attachments}`);
+        return num_attachments;
       }, {
         concurrency: 5
       });
     } catch (err) {
+
       // if a single table fails, the entire Promise.all() fails.  We do not want to kill the entire process
       // we should flag the base so that it can be scanned again in the future. 
       // this will skip the base from being written as "scanned"
@@ -226,7 +237,7 @@ async function run(db, scan_id, delete_data) {
     let num_records = record_numbers.reduce((aggregate, current) => {
       return aggregate + current;
     });
-    console.log(`${num_records} records written for ${base_id}`);
+    console.log(`${num_records} attachments scanned for ${base_id}`);
 
     // remove the admin from the base and mark the base as scanned
     // there are cases where the remove op will fail.  If the admin is a workspace collaborator, adding them at the base level is a no-op
@@ -243,65 +254,36 @@ async function run(db, scan_id, delete_data) {
         throw err;
       }
     }
-
-    // finally, update the bases scan time and scan id
-    await asyncOp(db, `UPDATE bases SET scan_time=?, scan_id=? WHERE id=?;`, [now.toISOString(), scan_id, base_id]);
   }, {
     concurrency: 2
   });
-
-
-  // after we've scanned all bases, check if we need to delete data
-  if (delete_data !== true) {
-    console.log("Delete data flag not passed.  Not deleting any bases or data");
-    return;
-  }
-  console.log("Delete data flag passed.  Beginning to remove bases and data that no longer exist in Enterprise account");
-
-  // delete bases
-  await deleteData(db, scan_id, 'bases', 'id');
-
-  // delete records
-  await deleteData(db, scan_id, 'data', 'record_id');
-
 }
 
 // assumes that all database tables have already been created
 if (require.main === module) {
-  // create the scan ID for this scan
-  var scan_id = uuid.v4();
-
-  if (argv.scan_id !== undefined) {
-    console.log("Using supplied scan ID: ", argv.scan_id);
-    scan_id = argv.scan_id;
-  }
-  console.log("Scan ID: ", scan_id);
-
-  var delete_data = false;
-  if (argv.delete_data !== undefined) {
-    delete_data = true;
-  }
-  console.log("delete_data flag provided.  Will remove data at end of script if applicable");
-
-
-  var db = new sqlite3.Database('export.sqlite');
   var tic = new Date();
-  run(db, scan_id, delete_data)
+  const bases = [{
+      id: 'appoynkzt5FR4PvBx'
+    },
+    {
+      id: 'appbjKeEyMXTWMkn5'
+    }
+  ];
+
+  run(bases)
     .then((res) => {
       let toc = new Date();
       if (UNSCANNED_BASES.length !== 0) {
         console.log('WARN: could not scan all bases.  Here are the ones we had to skip');
         console.log(JSON.stringify(UNSCANNED_BASES));
       }
-      console.log(`Success ${scan_id}.  Base data parsed`);
+      console.log(`Success.  Attachments downloaded`);
       console.log(`Operation took ${(toc.getTime()-tic.getTime())/1000} seconds`);
-      db.close();
     })
     .catch((err) => {
       let toc = new Date();
       console.log("ERR: ", err)
       console.log("Exiting: ", toc);
-      db.close();
       return;
     });
 
