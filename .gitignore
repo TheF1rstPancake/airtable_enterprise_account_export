@@ -1,4 +1,5 @@
 *.sqlite
+*.csv
 attachments/
 !attachments/README.md
 

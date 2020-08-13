@@ -8,7 +8,9 @@ const uuid = require('uuid');
 const fs = require('fs');
 const path = require('path');
 
-const ATTACHMENT_DIR = './attachments';
+const csv = require('fast-csv');
+
+const ATTACHMENT_DIR = path.join('.', 'attachments');
 
 const argv = require('yargs')
   .scriptName("bulk-export")
@@ -98,15 +100,24 @@ async function downloadAttachmentsAsync(base_id, table, records, attachment_fiel
     // the file path for any given file is our attachment
     // directory + (attachment ID_filename) 
     // using the ID ensures we don't overwrite files that may have the same name in a base
-    var file = path.join(attachment_path, `${a.id}_${a.filename}`);
-    var writer = fs.createWriteStream(file);
+    var cleaned_name = a.filename.replace("?authuser=0", '');
+    var file = path.join(attachment_path, `${a.id}_${cleaned_name}`);
 
-    response.data.pipe(writer);
-    var p = new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-    await p;
+
+    try {
+      var writer = fs.createWriteStream(file);
+
+      response.data.pipe(writer);
+      var p = new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+      await p;
+    } catch (err) {
+      console.log("ERR: could not write file to ", file);
+      console.log(err);
+
+    }
     return;
   }, {
     concurrency: 10
@@ -262,16 +273,28 @@ async function run(bases) {
 // assumes that all database tables have already been created
 if (require.main === module) {
   var tic = new Date();
-  const bases = [{
-      id: 'appoynkzt5FR4PvBx'
-    },
-    {
-      id: 'appbjKeEyMXTWMkn5'
-    }
-  ];
 
-  run(bases)
-    .then((res) => {
+  var p = new Promise((resolve, reject) => {
+    let rows = []
+    fs.createReadStream(path.join('.', 'listofbases.csv'))
+      .pipe(csv.parse({
+        headers: true
+      }))
+      .on('data', row => {
+        rows.push(row);
+      })
+      .on('end', () => {
+        resolve(rows);
+      })
+      .on('error', (err) => {
+        reject(err);
+      })
+  });
+
+  Promise.resolve(p)
+    .then((bases) => {
+      return run(bases)
+    }).then((res) => {
       let toc = new Date();
       if (UNSCANNED_BASES.length !== 0) {
         console.log('WARN: could not scan all bases.  Here are the ones we had to skip');
