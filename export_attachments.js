@@ -100,7 +100,7 @@ async function downloadAttachmentsAsync(base_id, table, records, attachment_fiel
     // the file path for any given file is our attachment
     // directory + (attachment ID_filename) 
     // using the ID ensures we don't overwrite files that may have the same name in a base
-    var cleaned_name = a.filename.replace("?authuser=0", '');
+    var cleaned_name = a.filename.replace(/[<>:"/\\|?\*]/g, '');
     var file = path.join(attachment_path, `${a.id}_${cleaned_name}`);
 
 
