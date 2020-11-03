@@ -42,15 +42,23 @@ async function run(db) {
     var queue = [];
     console.log("Fetching workspace data and writing to database");
     await Promise.map(workspaces, async (wid) => {
-      let r = await admin.get(`meta/workspaces/${wid}?include=collaborators`);
+      var url = `meta/workspaces/${wid}?include=collaborators`;
+      console.log("Looking up workspace: ", url);
+      let r = await admin.get(url);
 
-      let owners = r.data.collaborators.workspaceCollaborators.filter((o) => {
-        if (o.permissionLevel === 'owner') {
-          return o;
-        }
-      }).map(o => {
-        return o.email
-      }).join(',');
+      let collabs = r.data.collaborators.workspaceCollaborators;
+      var owners = null;
+      if (collabs === undefined) {
+        console.log("WARN: no workspace collaborators found for ", wid);
+      } else {
+        owners = r.data.collaborators.workspaceCollaborators.filter((o) => {
+          if (o.permissionLevel === 'owner') {
+            return o;
+          }
+        }).map(o => {
+          return o.email
+        }).join(',');
+      }
 
       // build the payload for what we will write to our local database about the workspace
       let payload = {
